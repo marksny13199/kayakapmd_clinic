@@ -52,9 +52,11 @@ if ($relativePath !== '' && is_file($file)) {
         $realFile !== false &&
         strpos($realFile, $publicPrefix) === 0
     ) {
-        $mime = function_exists('mime_content_type')
-            ? mime_content_type($realFile)
-            : false;
+        $mime = strtolower(pathinfo($realFile, PATHINFO_EXTENSION)) === 'css'
+            ? 'text/css; charset=UTF-8'
+            : (function_exists('mime_content_type')
+                ? mime_content_type($realFile)
+                : false);
 
         header('Content-Type: ' . ($mime ?: 'application/octet-stream'));
         header('Content-Length: ' . filesize($realFile));
