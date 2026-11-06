@@ -1,14 +1,20 @@
-import { defineConfig } from 'vite';
+import { defineConfig, loadEnv } from 'vite';
 import laravel from 'laravel-vite-plugin';
 import inject from '@rollup/plugin-inject';
 
+const env = loadEnv('development', process.cwd(), '');
+const appUrl = new URL(env.APP_URL || 'http://localhost:8000');
+const devServerHost = appUrl.hostname;
+
 export default defineConfig({
-    base: '',//'/EConsultationv2/public/build/',
+    base: '', // Keep existing base configuration
+
     plugins: [
         laravel({
             input: [
                 'resources/css/app.css',
                 'resources/js/app.js',
+
                 // Admin pages
                 'resources/js/pages/admin/dashboard.js',
                 'resources/js/pages/admin/profile.js',
@@ -43,36 +49,60 @@ export default defineConfig({
                 'resources/js/pages/admin/stocks/stock_listing.js',
                 'resources/js/pages/admin/stocks/stock_management.js',
                 'resources/js/pages/admin/stocks/groupings.js',
+
                 // Doctor pages
                 'resources/js/pages/doctor/dashboard.js',
                 'resources/js/pages/doctor/consultation.js',
                 'resources/js/pages/doctor/patients.js',
                 'resources/js/pages/doctor/consultation/form.js',
-                // Admin philhealth pages
-                'resources/js/pages/admin/philhealth/yakap-management.js',
-                'resources/js/pages/admin/philhealth/soap-form.js',
+
                 // Secretary pages
                 'resources/js/pages/secretary/queue.js',
                 'resources/js/pages/secretary/hmo.js',
             ],
             refresh: true,
         }),
+
         inject({
             $: 'jquery',
             jQuery: 'jquery',
         }),
     ],
-    // Detailed comment: Configure Vite development server to bind explicitly to localhost
-    // and specify a clean HTTP origin, avoiding ambiguous IPv6 [::1] addresses in public/hot.
+
     server: {
-        host: 'localhost',
+        // Allow other devices on the LAN to reach Vite
+        host: '0.0.0.0',
         port: 5173,
         strictPort: true,
-        origin: 'http://localhost:5173',
+
+        // APP_URL provides the reachable host for the dev server on this machine.
+        origin: `http://${devServerHost}:5173`,
+
+        hmr: {
+            host: devServerHost,
+            protocol: 'ws',
+            clientPort: 5173,
+        },
+
         watch: {
             ignored: ['**/storage/framework/views/**'],
-        }
+        },
+
+        cors: {
+            origin: [
+                appUrl.origin,
+                'http://localhost:8000',
+                'http://127.0.0.1:8000',
+            ],
+            methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+            allowedHeaders: [
+                'Content-Type',
+                'Authorization',
+                'X-Requested-With',
+            ],
+        },
     },
+
     build: {
         rollupOptions: {
             output: {
@@ -80,8 +110,8 @@ export default defineConfig({
                     if (id.includes('node_modules')) {
                         return 'vendor';
                     }
-                }
-            }
-        }
-    }
+                },
+            },
+        },
+    },
 });

@@ -7,6 +7,7 @@ use App\Models\ThemeModel;
 use Illuminate\Support\Facades\Schema;
 use Illuminate\Support\Facades\View;
 use Illuminate\Support\ServiceProvider;
+use Illuminate\Support\Facades\URL;
 
 class AppServiceProvider extends ServiceProvider
 {
@@ -27,6 +28,7 @@ class AppServiceProvider extends ServiceProvider
      */
     public function boot(): void
     {
+        URL::forceRootUrl(config('app.url'));
         Schema::defaultStringLength(191);
 
         // Detailed Comment: Global View composer injecting $activeTheme and $activeProfile into all Blade views

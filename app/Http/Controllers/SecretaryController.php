@@ -4,7 +4,6 @@ namespace App\Http\Controllers;
 
 use App\Models\HMOModel;
 use App\Models\SecretaryModel;
-use Date;
 use DateTime;
 use Carbon\Carbon;
 use Illuminate\Http\Request;
@@ -19,15 +18,14 @@ use App\Models\ServicesGroupManagementModel;
 use App\Models\ServicesManagementModel;
 use App\Models\Stocks\StocksLedgerModel;
 use App\Models\PatientMasterlist;
+use App\Models\PatientClassificationModel;
 use App\Models\PxMedicalHistoryModel;
 use App\Models\KayakapProfileModel;
-// Detailed Comment: Import legacy clinical models (pxrxdocuments, docrequests, diagnostics_masterlist, doccharges, stocks_listing)
-// to support defensive fallback and data synchronization for historical consultations in fetchPatientMedhistory
+// Detailed Comment: Legacy clinical models used as defensive fallback for historical consultations in fetchPatientMedhistory
 use App\Models\DocChargesModel;
 use App\Models\DocRequestsModel;
 use App\Models\DoctorMedicinesModel;
 use App\Models\DiagnosticsMasterlistModel;
-use App\Models\Stocks\StocksListingModel;
 use App\Models\Libraries\MDiseaseLibModel;
 use App\Models\ProfileModel;
 use App\Models\Profiles\ProfileMedHistModel;
@@ -35,9 +33,13 @@ use App\Models\Profiles\ProfileMhSpecificModel;
 use App\Models\Profiles\ProfileSurgHistModel;
 use App\Services\ClientService;
 use Barryvdh\DomPDF\Facade\Pdf;
+use Illuminate\Contracts\Encryption\DecryptException;
+use Illuminate\Support\Facades\Date;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Hash;
 use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Facades\Schema;
+use Illuminate\Validation\ValidationException;
 
 class SecretaryController extends Controller
 {
@@ -49,8 +51,7 @@ class SecretaryController extends Controller
     public function queuePage()
     {
         // Detailed Comment: Resolve authenticated user across secretary and admin guards.
-        // For admin users accessing the secretary queue console, load all active doctors so the dropdown
-        // and queue filtering operate without restriction, while secretaries only see assigned doctors.
+        // Admins see all doctors; secretaries only see assigned doctors.
         $secUser = auth()->guard('secretary')->user();
         $isAdmin = auth()->guard('admin')->check();
 
@@ -68,15 +69,15 @@ class SecretaryController extends Controller
 
         $secretaries = SecretaryModel::select(['secrefno', 'seclname', 'secfname'])->get();
 
-        // Detailed Comment: Load active patient classifications and dynamic sub-fields for secretary consultation form
-        $patientClassifications = \App\Models\PatientClassificationModel::active()->get();
+        // Detailed Comment: Patient classifications from lib_hci_class (CLASS_CODE, CLASS_DEF) for the
+        // secretary consultation form. The table has no status column, so there is no "active" scope.
+        $patientClassifications = PatientClassificationModel::orderBy('CLASS_DEF')->get();
 
-        // Detailed Comment: Load active disease library entries for Yakap Medical History/Profiling modal checklist
+        // Detailed Comment: Active disease library entries for Yakap Medical History modal checklist
         $mDiseaseLibrary = MDiseaseLibModel::where('lib_stat', 1)
             ->orderBy('sort_no')
             ->get();
 
-        // Detailed Comment: Structured logging when secretary queue page is rendered
         Log::info('Secretary queue page rendered', [
             'is_admin' => $isAdmin,
             'secretary_id' => $secUser ? $secUser->id : null,
@@ -94,7 +95,7 @@ class SecretaryController extends Controller
         ]);
     }
 
-    //for loading new reference and patient codes
+    // for loading new reference and patient codes
     public function generateNewCodes()
     {
         return response()->json([
@@ -105,42 +106,59 @@ class SecretaryController extends Controller
 
     private function generateReferenceCode()
     {
-        // Set timezone to Philippines
+        // Format: CRNW + MMDDYYYY + HHMMSS (Philippines timezone)
         $now = Carbon::now('Asia/Manila');
-
-        // Format: CRNW + MMDDYYYY + HHMMSS
-        $refCode = 'CRNW' . $now->format('mdYHis');
-
-        return $refCode;
+        return 'CRNW' . $now->format('mdYHis');
     }
 
     private function generatePatientCode()
     {
-        // Set timezone to Philippines
+        // Format: PTNW + MMDDYYYY + HHMMSS (Philippines timezone)
         $now = Carbon::now('Asia/Manila');
+        return 'PTNW' . $now->format('mdYHis');
+    }
 
-        // Format: PTNW + MMDDYYYY + HHMMSS
-        $patientCode = 'PTN' . $now->format('YHis');
+    /**
+     * Detailed Comment: Builds a unique-ish reference number: MMDDYYYYHHMMSS + suffix + 2 random digits,
+     * so two records created in the same second no longer collide.
+     */
+    private function makeRefNo(string $suffix): string
+    {
+        return Date::now()->format('mdYHis') . $suffix . random_int(10, 99);
+    }
 
-        return $patientCode;
+    /**
+     * Detailed Comment: Display name of the current actor across secretary/admin guards.
+     */
+    private function currentActorName(): string
+    {
+        if (auth()->guard('secretary')->check()) {
+            return auth()->guard('secretary')->user()->seclname ?? 'Secretary';
+        }
+        if (auth()->guard('admin')->check()) {
+            return auth()->guard('admin')->user()->name ?? 'Administrator';
+        }
+        return 'System';
     }
 
     // Management
     public function management()
     {
+        // NOTE: if this throws "View not found", change to 'pages.secretary.management' (queuePage uses the pages. prefix).
         return view('secretary.management');
     }
 
     public function fetchDoctorsFromSecretary()
     {
-        // Detailed Comment: Safely retrieve assigned doctors for secretary login,
-        // or return all doctors if an administrator is requesting doctors for queue filtering.
+        // Detailed Comment: Secretaries get assigned doctors only; admins get all; anyone else is rejected.
         $secUser = auth()->guard('secretary')->user();
         if ($secUser) {
             $assigned_doctors = SecretaryDoctorsModel::where(['secrefno' => $secUser->secrefno])->pluck('docrefno');
             $doctors = DoctorsProfileModel::select(['docrefno', 'docname'])->whereIn('docrefno', $assigned_doctors)->get();
-        } else {
+        } elseif (auth()->guard('admin')->check()) {
             $doctors = DoctorsProfileModel::select(['docrefno', 'docname'])->get();
+        } else {
+            return response()->json(['success' => false, 'message' => 'Unauthorized'], 401);
         }
 
         return response()->json(['success' => true, 'doctors' => $doctors]);
@@ -180,7 +198,7 @@ class SecretaryController extends Controller
         return response()->json(['success' => true, 'question' => $question]);
     }
 
-    // Detailed Comment: Create a new doctor question; authorizes both admin and secretary guards, resolves doctor full name, and returns clean 404 on missing doctor
+    // Detailed Comment: Create a new doctor question; authorizes admin and secretary guards, resolves doctor full name
     public function createQuestion(Request $request)
     {
         $docrefno = $request->input('docrefno') ?: $request->input('docid');
@@ -203,7 +221,6 @@ class SecretaryController extends Controller
             return response()->json(['success' => false, 'message' => 'Doctor profile not found.'], 404);
         }
 
-        // Detailed Comment: Resolve doctor full name using real schema columns (docname or docfname, docmname, doclname, suffix)
         $docname = $doctor->docname ?: trim(implode(' ', array_filter([$doctor->docfname, $doctor->docmname, $doctor->doclname, $doctor->suffix])));
         if (!$docname) {
             $docname = 'Doctor';
@@ -213,7 +230,7 @@ class SecretaryController extends Controller
         $recordedby = $user->username ?? 'admin';
 
         $question = DoctorQuestionsModel::create([
-            'docquestionrefno' => Date::now()->format('mdYHis') . "QT",
+            'docquestionrefno' => $this->makeRefNo('QT'),
             'secrefno' => $secrefno,
             'question' => $request->question,
             'docrefno' => $request->docrefno,
@@ -231,7 +248,7 @@ class SecretaryController extends Controller
         return response()->json(['success' => true, 'question' => $question]);
     }
 
-    // Detailed Comment: Edit an existing doctor question by reference number with authentication and 404 handling
+    // Detailed Comment: Edit an existing doctor question by reference number
     public function editQuestion(Request $request)
     {
         $refno = $request->input('docquestionrefno') ?: $request->input('id') ?: $request->route('id');
@@ -266,7 +283,7 @@ class SecretaryController extends Controller
         return response()->json(['success' => true, 'question' => $question]);
     }
 
-    // Detailed Comment: Delete a doctor question by reference number or route ID with authentication and 404 handling
+    // Detailed Comment: Delete a doctor question by reference number or route ID
     public function deleteQuestion(Request $request, $id = null)
     {
         $refno = $request->input('docquestionrefno') ?: $request->input('id') ?: $id ?: $request->route('id');
@@ -310,7 +327,7 @@ class SecretaryController extends Controller
             'docrefno' => 'required|string'
         ]);
 
-        // Detailed Comment: Order by natural day of the week (Sunday through Saturday), then by start time using ANSI SQL CASE
+        // Detailed Comment: Order by natural day of the week (Sunday..Saturday), then by start time
         $dayOrderSql = "CASE day
             WHEN 'Sunday' THEN 1
             WHEN 'Monday' THEN 2
@@ -340,21 +357,14 @@ class SecretaryController extends Controller
 
     /**
      * Detailed Comment: Fetch a doctor's clinic time slots for the weekday of the requested consultation date.
-     * Used by the Secretary Console (admin + secretary) to populate #stime, #sched_time and #resched_time.
-     *
-     * Fix (secretary console unable to detect doctor schedules):
-     * - When no doctor is selected ("None" in #doctor_id) the request used to run a query with a NULL docrefno and
-     *   silently return an empty list, which the UI rendered as the misleading "No schedules set.". We now return
-     *   `doctor_selected = false` so the UI can prompt the user to pick a doctor instead.
-     * - An unparsable date previously threw an uncaught exception (HTTP 500); it now falls back to today.
-     * - The response also carries `weekday` and the doctor's distinct `available_days`, so when the doctor simply
-     *   has no clinic on the chosen weekday the UI can say e.g. "No clinic on Monday (available: Saturday)".
+     * - No doctor selected -> returns doctor_selected = false so the UI can prompt the user.
+     * - Unparsable date -> falls back to today instead of throwing HTTP 500.
+     * - Also returns `weekday` and the doctor's distinct `available_days`.
      */
     public function fetchSchedulesSpecific(Request $request)
     {
         $docrefno = trim((string) $request->input('docrefno', ''));
 
-        // Detailed Comment: Parse the consultation date defensively; fall back to today's date on invalid input.
         try {
             $consulDate = $request->consuldate ? new DateTime($request->consuldate) : new DateTime();
         } catch (\Exception $e) {
@@ -366,8 +376,6 @@ class SecretaryController extends Controller
         }
         $weekday = $consulDate->format('l');
 
-        // Detailed Comment: No doctor selected -> nothing to look up; tell the UI explicitly instead of returning
-        // an empty list that is indistinguishable from "doctor has no schedule".
         if ($docrefno === '') {
             return response()->json([
                 'success' => true,
@@ -383,14 +391,12 @@ class SecretaryController extends Controller
             'day' => $weekday
         ])->orderBy('start', 'ASC')->get();
 
-        // Detailed Comment: Distinct weekdays on which this doctor holds clinic, ordered Sunday..Saturday,
-        // so the console can hint which dates are bookable when the selected weekday has no slots.
         $weekOrder = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
         $availableDays = ScheduleModel::where('docrefno', $docrefno)
             ->distinct()
             ->pluck('day')
             ->filter()
-            ->sortBy(fn ($day) => array_search($day, $weekOrder, true))
+            ->sortBy(fn($day) => array_search($day, $weekOrder, true))
             ->values();
 
         return response()->json([
@@ -402,8 +408,9 @@ class SecretaryController extends Controller
         ]);
     }
 
-    // Detailed Comment: To get specific schedule by schedrefno or route parameter
-    public function fetchScheduleByRef(Request $request, $schedrefno = null) {
+    // Detailed Comment: Get specific schedule by schedrefno or route parameter
+    public function fetchScheduleByRef(Request $request, $schedrefno = null)
+    {
         $refno = $request->input('schedrefno') ?: $request->input('id') ?: $schedrefno ?: $request->route('schedrefno');
         $sched = ScheduleModel::where('schedrefno', $refno)->first();
         if (!$sched) {
@@ -414,7 +421,8 @@ class SecretaryController extends Controller
     }
 
     // Detailed Comment: Edit doctor schedule; authenticates admin/secretary and validates existence
-    public function editSchedule(Request $request) {
+    public function editSchedule(Request $request)
+    {
         $user = auth()->guard('admin')->user() ?? auth()->guard('secretary')->user();
         if (!$user) {
             return response()->json(['success' => false, 'message' => 'Unauthorized'], 401);
@@ -442,13 +450,13 @@ class SecretaryController extends Controller
             'start' => $request->start,
             'end' => $request->end,
         ];
-        if ($request->has('notes') && \Illuminate\Support\Facades\Schema::hasColumn('docschedules', 'notes')) {
+        if ($request->has('notes') && Schema::hasColumn('docschedules', 'notes')) {
             $updateData['notes'] = $request->notes;
         }
 
         $sched->update($updateData);
 
-        // Detailed Comment: Automatically re-synchronize doctor's clinichours with updated docschedules
+        // Detailed Comment: Re-synchronize doctor's clinichours with updated docschedules
         $doctorProfile = DoctorsProfileModel::where('docrefno', $sched->docrefno)->first();
         if ($doctorProfile) {
             $doctorProfile->syncClinicHoursFromSchedules();
@@ -465,7 +473,7 @@ class SecretaryController extends Controller
         return response()->json(['success' => true, 'sched' => $sched, 'schedule' => $sched]);
     }
 
-    // Detailed Comment: Create doctor schedule; authenticates admin/secretary, validates doctor profile, and handles parameter key variations
+    // Detailed Comment: Create doctor schedule; supports both frontend keys (day, stime, etime) and API keys
     public function createSchedule(Request $request)
     {
         $user = auth()->guard('admin')->user() ?? auth()->guard('secretary')->user();
@@ -473,7 +481,6 @@ class SecretaryController extends Controller
             return response()->json(['success' => false, 'message' => 'Unauthorized'], 401);
         }
 
-        // Detailed Comment: Support both frontend modal parameter keys (day, stime, etime) and API keys (schedule_day, sched_from, sched_to)
         $docrefno = $request->input('docrefno') ?: $request->input('docid');
         $day = $request->input('schedule_day') ?: $request->input('day');
         $from = $request->input('sched_from') ?: $request->input('start') ?: $request->input('stime') ?: $request->input('start_time');
@@ -499,7 +506,8 @@ class SecretaryController extends Controller
             return response()->json(['success' => false, 'message' => 'Doctor profile not found.'], 404);
         }
 
-        $facilityClientCode = $user->clientcode ?? config('app.client_code', env('CLIENT_CODE', '122377'));
+        // env() must not be used outside config files (breaks with config:cache); add 'client_code' to config/app.php
+        $facilityClientCode = $user->clientcode ?? config('app.client_code', '122377');
         $schedrefno = Date::now()->format('mdYHis') . 'SCHED' . rand(10, 99);
 
         $scheduleData = [
@@ -511,17 +519,14 @@ class SecretaryController extends Controller
             'end' => $request->sched_to,
         ];
 
-        // Detailed Comment: Defensively verify if docschedules table contains notes column before persisting notes
-        if ($notes !== null && \Illuminate\Support\Facades\Schema::hasColumn('docschedules', 'notes')) {
+        if ($notes !== null && Schema::hasColumn('docschedules', 'notes')) {
             $scheduleData['notes'] = $notes;
         }
 
         $schedule = ScheduleModel::create($scheduleData);
 
-        // Detailed Comment: Automatically synchronize doctor's clinichours with newly created schedule
         $doctor->syncClinicHoursFromSchedules();
 
-        // Detailed Comment: Structured logging for schedule creation
         Log::info('Doctor schedule created', [
             'schedrefno' => $schedrefno,
             'docrefno' => $request->docrefno,
@@ -535,7 +540,8 @@ class SecretaryController extends Controller
     }
 
     // Detailed Comment: Delete doctor schedule; authenticates admin/secretary and deletes by schedrefno or route ID
-    public function deleteSchedule(Request $request, $id = null) {
+    public function deleteSchedule(Request $request, $id = null)
+    {
         $user = auth()->guard('admin')->user() ?? auth()->guard('secretary')->user();
         if (!$user) {
             return response()->json(['success' => false, 'message' => 'Unauthorized'], 401);
@@ -558,7 +564,6 @@ class SecretaryController extends Controller
         $docRefToDelete = $sched->docrefno;
         $sched->delete();
 
-        // Detailed Comment: Automatically re-synchronize doctor's clinichours after deletion
         if ($docRefToDelete) {
             $doctorProfile = DoctorsProfileModel::where('docrefno', $docRefToDelete)->first();
             if ($doctorProfile) {
@@ -578,14 +583,10 @@ class SecretaryController extends Controller
 
     public function createGroupManagement(Request $request)
     {
-        $servicegroup_name = $request->servicegroup_name;
-        $servicegroup_dscr = $request->servicegroup_dscr;
-
-
         ServicesGroupManagementModel::create([
-            'servicegroup_refno' => Date::now()->format('mdYHis') . "GRP",
-            "servicegroup_name" => $servicegroup_name,
-            "servicegroup_dscr" => $servicegroup_dscr
+            'servicegroup_refno' => $this->makeRefNo('GRP'),
+            'servicegroup_name' => $request->servicegroup_name,
+            'servicegroup_dscr' => $request->servicegroup_dscr
         ]);
 
         return response()->json(['success' => true]);
@@ -611,107 +612,82 @@ class SecretaryController extends Controller
         ]);
     }
 
+    // Detailed Comment: decrypt() is inside try so an invalid/tampered token returns a clean 400 instead of HTTP 500
     public function editGroupManagement(Request $request)
     {
-        $token = decrypt($request->token);
-
-        if (empty($token)) {
-            return response()->json([
-                'status' => false,
-                'message' => 'Empty Token'
-            ]);
-        }
-
         try {
+            $token = decrypt($request->token);
+
+            if (empty($token)) {
+                return response()->json(['status' => false, 'message' => 'Empty Token']);
+            }
+
             $result = ServicesGroupManagementModel::where('servicegroup_refno', $token)->first();
-            return response()->json([
-                'status' => true,
-                'message' => $result
-            ]);
+            if (!$result) {
+                return response()->json(['status' => false, 'message' => 'Group not found'], 404);
+            }
+
+            return response()->json(['status' => true, 'message' => $result]);
+        } catch (DecryptException $e) {
+            return response()->json(['status' => false, 'message' => 'Invalid token'], 400);
         } catch (\Exception $e) {
-            return response()->json([
-                'status' => false,
-                'message' => $e->getMessage()
-            ]);
+            return response()->json(['status' => false, 'message' => $e->getMessage()]);
         }
     }
 
     public function deleteGroupManagement(Request $request)
     {
         try {
-            // Decrypt token
             $token = decrypt($request->token);
 
             if (empty($token)) {
-                return response()->json([
-                    'status' => false,
-                    'message' => 'Empty Token'
-                ]);
+                return response()->json(['status' => false, 'message' => 'Empty Token']);
             }
 
-            // Find the record
             $group = ServicesGroupManagementModel::where('servicegroup_refno', $token)->first();
 
             if (!$group) {
-                return response()->json([
-                    'status' => false,
-                    'message' => 'Group not found'
-                ]);
+                return response()->json(['status' => false, 'message' => 'Group not found']);
             }
 
-            // Delete the record
             $group->delete();
 
-            return response()->json([
-                'status' => true,
-                'message' => 'Group deleted successfully'
-            ]);
+            return response()->json(['status' => true, 'message' => 'Group deleted successfully']);
+        } catch (DecryptException $e) {
+            return response()->json(['status' => false, 'message' => 'Invalid token'], 400);
         } catch (\Exception $e) {
-            return response()->json([
-                'status' => false,
-                'message' => $e->getMessage()
-            ]);
+            return response()->json(['status' => false, 'message' => $e->getMessage()]);
         }
     }
 
     public function updateGroupManagement(Request $request)
     {
         try {
-            // Decrypt token
             $token = decrypt($request->token);
 
             if (empty($token)) {
-                return response()->json([
-                    'status' => false,
-                    'message' => 'Empty Token'
-                ]);
+                return response()->json(['status' => false, 'message' => 'Empty Token']);
             }
 
-            // Find the record
             $group = ServicesGroupManagementModel::where('servicegroup_refno', $token)->first();
 
             if (!$group) {
-                return response()->json([
-                    'status' => false,
-                    'message' => 'Group not found'
-                ]);
+                return response()->json(['status' => false, 'message' => 'Group not found']);
             }
 
-            // Update the record
             $group->servicegroup_name = $request->servicegroup_name;
             $group->servicegroup_dscr = $request->servicegroup_dscr;
-            $group->save(); // saves changes
+            $group->save();
 
             return response()->json([
                 'status' => true,
                 'message' => 'Group updated successfully',
-                'data' => $group, // optional: return updated record
+                'data' => $group,
             ]);
+        } catch (DecryptException $e) {
+            return response()->json(['status' => false, 'message' => 'Invalid token'], 400);
         } catch (\Exception $e) {
-            return response()->json([
-                'status' => false,
-                'message' => $e->getMessage()
-            ]);
+            return response()->json(['status' => false, 'message' => $e->getMessage()]);
         }
     }
 
@@ -737,18 +713,16 @@ class SecretaryController extends Controller
     public function createServicesManagement(Request $request)
     {
         try {
-            // Optional: Validate the request
             $request->validate([
                 'servicename' => 'required|string|max:255',
                 'servicecharge' => 'required|numeric|min:0',
                 'category' => 'required|string|max:255',
                 'servicedscr' => 'nullable|string|max:1000',
-                'docrefno' => 'required|string|max:50', // or exists:doctors,refno
+                'docrefno' => 'required|string|max:50',
             ]);
 
-            // Insert into database
             $service = ServicesManagementModel::create([
-                'servicerefno' => Date::now()->format('mdYHis') . "SVC", // unique reference
+                'servicerefno' => $this->makeRefNo('SVC'),
                 'servicename' => $request->servicename,
                 'servicecharge' => $request->servicecharge,
                 'category' => $request->category,
@@ -761,6 +735,9 @@ class SecretaryController extends Controller
                 'message' => 'Service added successfully',
                 'data' => $service,
             ]);
+        } catch (ValidationException $e) {
+            // Detailed Comment: Let Laravel return proper 422 field errors instead of swallowing them
+            throw $e;
         } catch (\Exception $e) {
             return response()->json([
                 'status' => false,
@@ -771,13 +748,9 @@ class SecretaryController extends Controller
 
     public function fetchDoctorServices(Request $request)
     {
-        // 1️⃣ Fetch all services
         $services = ServicesManagementModel::all();
-
-        // 2️⃣ Fetch all doctors
         $doctors = DoctorsProfileModel::select('docrefno', 'docfname', 'doclname')->get()->keyBy('docrefno');
 
-        // 3️⃣ Map services and attach doctor fullname
         $result = $services->map(function ($service) use ($doctors) {
             $doctor = $doctors->get($service->docrefno);
 
@@ -793,7 +766,6 @@ class SecretaryController extends Controller
             ];
         });
 
-        // 4️⃣ Return JSON
         return response()->json([
             'doctorServices' => $result
         ]);
@@ -805,30 +777,18 @@ class SecretaryController extends Controller
             $token = decrypt($request->token);
 
             if (!$token) {
-                return response()->json([
-                    'status' => false,
-                    'message' => 'Empty token'
-                ]);
+                return response()->json(['status' => false, 'message' => 'Empty token']);
             }
 
             $service = ServicesManagementModel::where('servicerefno', $token)->first();
 
             if (!$service) {
-                return response()->json([
-                    'status' => false,
-                    'message' => 'Service not found'
-                ]);
+                return response()->json(['status' => false, 'message' => 'Service not found']);
             }
 
-            return response()->json([
-                'status' => true,
-                'data' => $service
-            ]);
+            return response()->json(['status' => true, 'data' => $service]);
         } catch (\Exception $e) {
-            return response()->json([
-                'status' => false,
-                'message' => 'Invalid payload'
-            ]);
+            return response()->json(['status' => false, 'message' => 'Invalid payload']);
         }
     }
 
@@ -840,23 +800,14 @@ class SecretaryController extends Controller
             $service = ServicesManagementModel::where('servicerefno', $token)->first();
 
             if (!$service) {
-                return response()->json([
-                    'status' => false,
-                    'message' => 'Service not found'
-                ]);
+                return response()->json(['status' => false, 'message' => 'Service not found']);
             }
 
             $service->delete();
 
-            return response()->json([
-                'status' => true,
-                'message' => 'Service deleted successfully'
-            ]);
+            return response()->json(['status' => true, 'message' => 'Service deleted successfully']);
         } catch (\Exception $e) {
-            return response()->json([
-                'status' => false,
-                'message' => 'Invalid payload'
-            ]);
+            return response()->json(['status' => false, 'message' => 'Invalid payload']);
         }
     }
 
@@ -866,22 +817,15 @@ class SecretaryController extends Controller
             $token = decrypt($request->token);
 
             if (!$token) {
-                return response()->json([
-                    'status' => false,
-                    'message' => 'Empty token'
-                ]);
+                return response()->json(['status' => false, 'message' => 'Empty token']);
             }
 
             $service = ServicesManagementModel::where('servicerefno', $token)->first();
 
             if (!$service) {
-                return response()->json([
-                    'status' => false,
-                    'message' => 'Service not found'
-                ]);
+                return response()->json(['status' => false, 'message' => 'Service not found']);
             }
 
-            // ✅ Update fields
             $service->servicename = $request->servicename;
             $service->servicecharge = $request->servicecharge;
             $service->category = $request->category;
@@ -894,14 +838,12 @@ class SecretaryController extends Controller
                 'data' => $service
             ]);
         } catch (\Exception $e) {
-            return response()->json([
-                'status' => false,
-                'message' => 'Invalid payload'
-            ]);
+            return response()->json(['status' => false, 'message' => 'Invalid payload']);
         }
     }
 
-    public function fetchSecretary(Request $request) {
+    public function fetchSecretary(Request $request)
+    {
         $user = auth()->guard('secretary')->user();
         if ($user) {
             $user->source_table = 'secretaryrights';
@@ -911,11 +853,11 @@ class SecretaryController extends Controller
     }
 
     /**
-     * Detailed Comment: Self-service profile update for authenticated secretary.
-     * Allows secretary to edit their own profile in 'secretaryrights' including username and password,
+     * Detailed Comment: Self-service profile update for authenticated secretary,
      * strictly bound to the authenticated secretary's secrefno to prevent cross-user tampering.
      */
-    public function updateSecretaryProfile(Request $request) {
+    public function updateSecretaryProfile(Request $request)
+    {
         $secAuth = auth()->guard('secretary')->user();
         if (!$secAuth) {
             return response()->json(['success' => false, 'message' => 'Unauthenticated secretary'], 401);
@@ -964,20 +906,18 @@ class SecretaryController extends Controller
 
     /**
      * Detailed Comment: Fetches comprehensive consultation and medical history for a patient in secretary queue.
-     * Returns full consultation modal dataset (vital signs, impressions, diagnosis, admission instructions,
-     * prescribed medications, diagnostics requested, lab/radiology files, and charges) to populate the
-     * dedicated Consultation Details modal per user requirements.
+     * Returns the full consultation modal dataset (vitals, impressions, diagnosis, admission instructions,
+     * medications, diagnostics, lab/radiology files, charges).
+     * Stocks ledger rows are bulk pre-loaded once (no per-consultation N+1 queries).
      */
-    public function fetchPatientMedhistory(Request $request) {
+    public function fetchPatientMedhistory(Request $request)
+    {
         $pincode = $request->input('pincode');
         $pxrefno = $request->input('pxrefno');
         $consultationrefno = $request->input('consultationrefno');
         $patientname = $request->input('patientname');
         $birthday = $request->input('birthday');
 
-        // Detailed Comment: Collect and cross-reference all possible patient identifiers
-        // across pxmasterlist and pxwalkinconsultation so that past consultations always appear
-        // regardless of whether older records used pincode, pxrefno, or name+birthday.
         $pxrefnoList = [];
         $pincodeList = [];
 
@@ -1018,7 +958,6 @@ class SecretaryController extends Controller
 
         $hasIdentifier = !empty($pxrefnoList) || !empty($pincodeList) || (!empty($patientname) && !empty($birthday)) || (!empty($consultationrefno) && $consultationrefno !== 'undefined');
 
-        // Detailed Comment: If no patient identifier was provided, return empty payload safely without querying entire table
         if (!$hasIdentifier) {
             return response()->json([
                 'draw' => intval($request->draw),
@@ -1061,9 +1000,8 @@ class SecretaryController extends Controller
             }
         });
 
-        // Detailed Comment: Query ConsultationModel with eager-loaded 'patient' (PatientMasterlist) relation.
-        // Crucially, 'address' is omitted from select() to resolve MySQL 1054 Unknown column 'address' on pxwalkinconsultation,
-        // and is resolved defensively from the authoritative pxmasterlist table during transformation.
+        // 'address' is intentionally omitted from select() (MySQL 1054 on pxwalkinconsultation);
+        // it is resolved from pxmasterlist during transformation.
         $history = $query->with('patient')
             ->select([
                 'id',
@@ -1077,11 +1015,9 @@ class SecretaryController extends Controller
                 'age',
                 'mobilenumber',
                 'emailaddress',
-                // 'address' removed to prevent MySQL 1054 error on pxwalkinconsultation
                 'photo_path',
                 'consultation_date',
                 'reasonforconsultation',
-                // Detailed Comment: Include Brief History of Present Illness and Pertinent Past Medical History for consultation details
                 'brief_history_present_illness',
                 'pertinent_past_medhistory',
                 'impression',
@@ -1116,19 +1052,40 @@ class SecretaryController extends Controller
             ->orderBy('id', 'desc')
             ->get();
 
-        // Detailed Comment: Bulk pre-load answered doctor questions joining docquestion on questionrefno = docquestionrefno
-        // to attach actual question text and patient answers onto every consultation history item without N+1 query overhead.
-        $allConsultationRefNos = $history->pluck('consultationrefno')->filter()->toArray();
+        // Bulk pre-load answered doctor questions
+        $allConsultationRefNos = $history->pluck('consultationrefno')->filter()->values()->toArray();
         $allAnswers = ConsultationAnswerModel::leftJoin('docquestion', 'walkinconsultation_answer.questionrefno', '=', 'docquestion.docquestionrefno')
             ->whereIn('walkinconsultation_answer.pxconsultationrefno', $allConsultationRefNos)
             ->select('walkinconsultation_answer.*', 'docquestion.question')
             ->get()
             ->groupBy('pxconsultationrefno');
 
-        // Detailed Comment: Bulk pre-load permanent medical history records (allergies, immunizations, past medical illnesses,
-        // surgical operations, family history, and maintenance medications) across all patient references.
-        $allPxRefNos = $history->pluck('pxrefno')->filter()->merge($pxrefnoList)->unique()->toArray();
-        $allPinCodes = $history->pluck('pincode')->filter()->merge($pincodeList)->unique()->toArray();
+        // Bulk pre-load stocks ledger rows (Rx, diagnostics, charges) once for all consultations
+        $allLedger = StocksLedgerModel::whereIn('px_consultcode_cn', $allConsultationRefNos)
+            ->select(['id', 'px_consultcode_cn', 'prodcode', 'item_dscr', 'item_grouping', 'qty', 'cost_ave', 'retails', 'totalamt', 'remarks', 'instructions', 'dispensed_status', 'dispensed', 'updated'])
+            ->get()
+            ->groupBy('px_consultcode_cn');
+
+        // Bulk pre-load legacy fallbacks only for consultations that have no ledger rows
+        $refsWithoutLedger = array_values(array_diff($allConsultationRefNos, $allLedger->keys()->toArray()));
+        $legacyMeds = !empty($refsWithoutLedger)
+            ? DoctorMedicinesModel::whereIn('consultationrefno', $refsWithoutLedger)->get()->groupBy('consultationrefno')
+            : collect();
+        $legacyReqs = !empty($refsWithoutLedger)
+            ? DocRequestsModel::whereIn('consultationrefno', $refsWithoutLedger)->get()->groupBy('consultationrefno')
+            : collect();
+        $legacyCharges = !empty($refsWithoutLedger)
+            ? DocChargesModel::whereIn('consultationrefno', $refsWithoutLedger)->get()->groupBy('consultationrefno')
+            : collect();
+        $masterDiagModels = $legacyReqs->isNotEmpty()
+            ? DiagnosticsMasterlistModel::whereIn('diagnosticrefno', $legacyReqs->flatten(1)->pluck('requestrefno')->filter()->unique()->toArray())
+            ->get()
+            ->keyBy('diagnosticrefno')
+            : collect();
+
+        // Bulk pre-load permanent medical history records
+        $allPxRefNos = $history->pluck('pxrefno')->filter()->merge($pxrefnoList)->unique()->values()->toArray();
+        $allPinCodes = $history->pluck('pincode')->filter()->merge($pincodeList)->unique()->values()->toArray();
 
         $allMedHistories = PxMedicalHistoryModel::where(function ($q) use ($allPxRefNos, $allPinCodes) {
             if (!empty($allPxRefNos)) {
@@ -1141,34 +1098,40 @@ class SecretaryController extends Controller
 
         $primaryMedHistory = $allMedHistories->first();
 
-        $history->transform(function ($record) use ($allAnswers, $allMedHistories, $primaryMedHistory) {
-            // Detailed Comment: Attach answered doctor questions directly to consultation record
-            $record->answers = $allAnswers->get($record->consultationrefno, collect());
+        $history->transform(function ($record) use (
+            $allAnswers,
+            $allMedHistories,
+            $primaryMedHistory,
+            $allLedger,
+            $legacyMeds,
+            $legacyReqs,
+            $legacyCharges,
+            $masterDiagModels
+        ) {
+            $ref = $record->consultationrefno;
 
-            // Detailed Comment: Attach patient permanent medical history directly to consultation record
+            $record->answers = $allAnswers->get($ref, collect());
+
             $recordMedHistory = $allMedHistories->first(function ($mh) use ($record) {
                 return (!empty($record->pxrefno) && $mh->pxrefno === $record->pxrefno) ||
-                       (!empty($record->pincode) && $mh->pincode === $record->pincode);
+                    (!empty($record->pincode) && $mh->pincode === $record->pincode);
             }) ?? $primaryMedHistory;
             $record->permanent_medhistory = $recordMedHistory;
-            // Detailed Comment: Defensive patient resolution. Eager loaded relation $record->patient is checked first;
-            // if null (e.g. walk-ins with missing relations), look up pxmasterlist by pxrefno or pincode.
+
+            // Defensive patient resolution: eager-loaded relation first, then pxmasterlist lookup
             $patientMaster = $record->patient ?? (
                 (!empty($record->pxrefno) || !empty($record->pincode))
-                    ? PatientMasterlist::where(function ($q) use ($record) {
-                        if (!empty($record->pxrefno)) {
-                            $q->where('pxrefno', $record->pxrefno);
-                        }
-                        if (!empty($record->pincode)) {
-                            $q->orWhere('pincode', $record->pincode);
-                        }
-                    })->first()
-                    : null
+                ? PatientMasterlist::where(function ($q) use ($record) {
+                    if (!empty($record->pxrefno)) {
+                        $q->where('pxrefno', $record->pxrefno);
+                    }
+                    if (!empty($record->pincode)) {
+                        $q->orWhere('pincode', $record->pincode);
+                    }
+                })->first()
+                : null
             );
 
-            // Detailed Comment: Populate patient address from PatientMasterlist components
-            // (streetadrs, brgy, muncity, province) or fallback to $patientMaster->address.
-            // Eliminates "N/A" placeholders and prevents database schema mismatch crashes.
             if ($patientMaster) {
                 $addrParts = array_filter([
                     $patientMaster->streetadrs,
@@ -1178,7 +1141,6 @@ class SecretaryController extends Controller
                 ]);
                 $record->address = !empty($addrParts) ? implode(', ', $addrParts) : ($patientMaster->address ?? 'N/A');
 
-                // Detailed Comment: Backfill demographics from patient masterlist if empty on consultation
                 if (empty($record->pincode)) {
                     $record->pincode = $patientMaster->pincode ?: ($patientMaster->phic_pin ?: 'N/A');
                 }
@@ -1204,13 +1166,12 @@ class SecretaryController extends Controller
                 $record->address = 'N/A';
             }
 
-            // Detailed Comment: Provide contract aliases for frontend components (pin, ref, contactno, sex)
+            // Contract aliases for frontend components
             $record->pin = $record->pincode;
             $record->ref = $record->pxrefno;
             $record->contactno = $record->mobilenumber;
             $record->sex = $record->gender;
 
-            // Detailed Comment: Dynamically calculate patient age from birthday if age is null or empty
             if (empty($record->age) && !empty($record->birthday)) {
                 try {
                     $record->age = Carbon::parse($record->birthday)->age;
@@ -1219,7 +1180,6 @@ class SecretaryController extends Controller
                 }
             }
 
-            // Detailed Comment: Format patient avatar photo URL
             if ($record->photo_path && !str_contains($record->photo_path, 'blank_photo.png')) {
                 $filename = basename($record->photo_path);
                 $record->photo_path = url('/patient/photo/' . $filename);
@@ -1229,8 +1189,6 @@ class SecretaryController extends Controller
                 $record->photo_url = url('/images/blank_photo.png');
             }
 
-            // Detailed Comment: Generate valid file preview URLs for radiology and laboratory attachments
-            // using the secure named route 'preview.file' pointing to the authenticated storage streaming handler.
             $record->radiology_url = (!empty($record->radiologypath) && is_string($record->radiologypath))
                 ? route('preview.file', ['path' => $record->radiologypath])
                 : null;
@@ -1238,13 +1196,13 @@ class SecretaryController extends Controller
                 ? route('preview.file', ['path' => $record->laboratorypath])
                 : null;
 
-            // Detailed Comment: Prescriptions (Rx) from stocks_ledger with graceful fallback to legacy DoctorMedicinesModel (pxrxdocuments)
-            // Maps dispensed_flag dynamically from dispensed_status / dispensed date for API & UI consistency
-            $rxItems = StocksLedgerModel::where('px_consultcode_cn', $record->consultationrefno)
-                ->where('item_grouping', 'DRUGS AND MEDS')
-                ->select(['prodcode', 'item_dscr', 'qty', 'remarks', 'instructions', 'dispensed_status', 'dispensed'])
-                ->get()
+            // Ledger rows for this consultation (already loaded in bulk)
+            $ledger = $allLedger->get($ref, collect());
+
+            // Prescriptions (Rx) with fallback to legacy DoctorMedicinesModel
+            $rxItems = $ledger->where('item_grouping', 'DRUGS AND MEDS')->values()
                 ->map(function ($rx) {
+                    $rx = clone $rx;
                     $rx->dispensed_flag = ($rx->dispensed_status === 'RELEASED' || !empty($rx->dispensed)) ? 1 : 0;
                     $rx->med_name = $rx->item_dscr;
                     $rx->dosage = $rx->remarks;
@@ -1254,35 +1212,31 @@ class SecretaryController extends Controller
                 });
 
             if ($rxItems->isEmpty()) {
-                $legacyRx = DoctorMedicinesModel::where('consultationrefno', $record->consultationrefno)->get()
-                    ->map(function ($docRx) {
-                        return (object)[
-                            'prodcode' => $docRx->medicinecode ?? 'RX',
-                            'item_dscr' => $docRx->medicinename,
-                            'med_name' => $docRx->medicinename,
-                            'qty' => $docRx->medicinequantity ?: 1,
-                            'quantity' => $docRx->medicinequantity ?: 1,
-                            'remarks' => $docRx->medicinedosage ?? 'As directed',
-                            'dosage' => $docRx->medicinedosage ?? 'As directed',
-                            'instructions' => $docRx->medicineduration ?? '',
-                            'dispensed_status' => 'PENDING',
-                            'dispensed' => null,
-                            'dispensed_flag' => 0,
-                            'is_dispensed' => false,
-                        ];
-                    });
-                $record->rx_items = $legacyRx;
+                $record->rx_items = $legacyMeds->get($ref, collect())->map(function ($docRx) {
+                    return (object)[
+                        'prodcode' => $docRx->medicinecode ?? 'RX',
+                        'item_dscr' => $docRx->medicinename,
+                        'med_name' => $docRx->medicinename,
+                        'qty' => $docRx->medicinequantity ?: 1,
+                        'quantity' => $docRx->medicinequantity ?: 1,
+                        'remarks' => $docRx->medicinedosage ?? 'As directed',
+                        'dosage' => $docRx->medicinedosage ?? 'As directed',
+                        'instructions' => $docRx->medicineduration ?? '',
+                        'dispensed_status' => 'PENDING',
+                        'dispensed' => null,
+                        'dispensed_flag' => 0,
+                        'is_dispensed' => false,
+                    ];
+                })->values();
             } else {
                 $record->rx_items = $rxItems;
             }
             $record->prescriptions = $record->rx_items;
 
-            // Detailed Comment: Diagnostic requests from stocks_ledger with graceful fallback to legacy DocRequestsModel & DiagnosticsMasterlistModel
-            $diagItems = StocksLedgerModel::where('px_consultcode_cn', $record->consultationrefno)
-                ->whereIn('item_grouping', ['DIAGNOSTIC', 'IMAGING'])
-                ->select(['prodcode', 'item_dscr', 'item_grouping', 'remarks', 'updated'])
-                ->get()
+            // Diagnostic requests with fallback to legacy DocRequestsModel & DiagnosticsMasterlistModel
+            $diagItems = $ledger->whereIn('item_grouping', ['DIAGNOSTIC', 'IMAGING'])->values()
                 ->map(function ($diag) {
+                    $diag = clone $diag;
                     $diag->exam_name = $diag->item_dscr;
                     $diag->category = $diag->item_grouping;
                     $diag->notes = $diag->remarks;
@@ -1291,12 +1245,7 @@ class SecretaryController extends Controller
                 });
 
             if ($diagItems->isEmpty()) {
-                $pxreq = DocRequestsModel::where(['consultationrefno' => $record->consultationrefno])->get();
-                $masterDiagModels = DiagnosticsMasterlistModel::whereIn('diagnosticrefno', $pxreq->pluck('requestrefno')->toArray())
-                    ->get()
-                    ->keyBy('diagnosticrefno');
-
-                $legacyDiags = $pxreq->map(function ($req) use ($masterDiagModels) {
+                $record->diagnostic_items = $legacyReqs->get($ref, collect())->map(function ($req) use ($masterDiagModels) {
                     $master = $masterDiagModels->get($req->requestrefno);
                     return (object)[
                         'prodcode' => $req->requestrefno,
@@ -1309,52 +1258,49 @@ class SecretaryController extends Controller
                         'requested_at' => $req->created_at ?? $req->recorddate ?? '',
                         'updated' => $req->recorddate ?? '',
                     ];
-                });
-                $record->diagnostic_items = $legacyDiags;
+                })->values();
             } else {
                 $record->diagnostic_items = $diagItems;
             }
             $record->diagnostics = $record->diagnostic_items;
 
-            // Detailed Comment: Charges from stocks_ledger including retails and computed totalamt
-            $record->charges = StocksLedgerModel::where('px_consultcode_cn', $record->consultationrefno)
-                ->select(['id', 'prodcode', 'item_dscr', 'item_grouping', 'qty', 'cost_ave', 'retails', 'totalamt'])
-                ->get()
-                ->map(function ($c) {
-                    $c->item_name = $c->item_dscr;
-                    $c->unit_price = $c->cost_ave ?: $c->retails;
-                    $c->category = $c->item_grouping;
-                    return $c;
-                });
+            // Charges from the ledger with fallback to legacy DocChargesModel
+            $charges = $ledger->values()->map(function ($c) {
+                $c = clone $c;
+                $c->item_name = $c->item_dscr;
+                $c->unit_price = $c->cost_ave ?: $c->retails;
+                $c->category = $c->item_grouping;
+                return $c;
+            });
 
-            if ($record->charges->isEmpty()) {
-                $legacyCharges = DocChargesModel::where('consultationrefno', $record->consultationrefno)->get()
-                    ->map(function ($dc) {
-                        $qty = $dc->quantity ?: ($dc->qty ?: 1);
-                        $unit = $dc->charge ?: ($dc->rate ?: 0);
-                        $total = $dc->net_total ?: ($dc->total ?: ($dc->totalamt ?? ($qty * $unit)));
-                        $name = $dc->servicename ?: ($dc->chargedesc ?? 'Charge');
-                        $code = $dc->servicerefno ?: ($dc->chargecode ?? 'CHARGE');
-                        return (object)[
-                            'id' => $dc->id,
-                            'prodcode' => $code,
-                            'item_dscr' => $name,
-                            'item_name' => $name,
-                            'item_grouping' => 'PROFESSIONAL FEE',
-                            'category' => 'PROFESSIONAL FEE',
-                            'qty' => $qty,
-                            'cost_ave' => $unit,
-                            'retails' => $unit,
-                            'unit_price' => $unit,
-                            'totalamt' => $total,
-                        ];
-                    });
-                if ($legacyCharges->isNotEmpty()) {
-                    $record->charges = $legacyCharges;
+            if ($charges->isEmpty()) {
+                $fallback = $legacyCharges->get($ref, collect())->map(function ($dc) {
+                    $qty = $dc->quantity ?: ($dc->qty ?: 1);
+                    $unit = $dc->charge ?: ($dc->rate ?: 0);
+                    $total = $dc->net_total ?: ($dc->total ?: ($dc->totalamt ?? ($qty * $unit)));
+                    $name = $dc->servicename ?: ($dc->chargedesc ?? 'Charge');
+                    $code = $dc->servicerefno ?: ($dc->chargecode ?? 'CHARGE');
+                    return (object)[
+                        'id' => $dc->id,
+                        'prodcode' => $code,
+                        'item_dscr' => $name,
+                        'item_name' => $name,
+                        'item_grouping' => 'PROFESSIONAL FEE',
+                        'category' => 'PROFESSIONAL FEE',
+                        'qty' => $qty,
+                        'cost_ave' => $unit,
+                        'retails' => $unit,
+                        'unit_price' => $unit,
+                        'totalamt' => $total,
+                    ];
+                })->values();
+                if ($fallback->isNotEmpty()) {
+                    $charges = $fallback;
                 }
             }
 
-            $record->charges_total = round((float) $record->charges->sum('totalamt'), 2);
+            $record->charges = $charges;
+            $record->charges_total = round((float) $charges->sum('totalamt'), 2);
 
             return $record;
         });
@@ -1372,7 +1318,8 @@ class SecretaryController extends Controller
     }
 
     // Settlements-related
-    public function fetchSettlements(Request $request) {
+    public function fetchSettlements(Request $request)
+    {
         $record = SettlementsModel::where(['consultationrefno' => $request->consultationrefno])->first();
 
         if ($record) {
@@ -1383,19 +1330,30 @@ class SecretaryController extends Controller
     }
 
     /**
-     * Detailed Comment: Saves or updates consultation billing settlements across Cash, Card (CTA),
-     * Detailed Comment: Saves and updates patient consultation billing settlement details in pxsettlements.
-     * Computes gross charges and categorized subtotals from stocks_ledger (DRUGS AND MEDS, DIAGNOSTIC,
-     * PROFESSIONAL FEE, PROCEDURES, SUPPLIES, VACCINES, IMMUNIZATION), applies PhilHealth (PHIC) and HMO
-     * deductions, records cash and card payment channels, generates transaction reference number (TRX...),
-     * and logs structured audit events.
+     * Detailed Comment: Saves or updates patient consultation billing settlement details in pxsettlements.
+     * Computes gross charges and categorized subtotals from stocks_ledger, applies Senior/PWD, PhilHealth (PHIC),
+     * HMO and custom discounts, records cash and card payment channels, generates the transaction reference
+     * number (TRX...) once, and logs structured audit events.
+     * created/createdby are only set on creation so later edits do not overwrite the original audit data.
      */
-    public function saveSettlements(Request $request) {
+    public function saveSettlements(Request $request)
+    {
+        $user = auth()->guard('secretary')->user() ?? auth()->guard('admin')->user();
+        if (!$user) {
+            return response()->json(['success' => false, 'message' => 'Unauthorized'], 401);
+        }
+        $actor = $this->currentActorName();
+
         $consultRef = $request->sett_consultationrefno ?: $request->consultationrefno;
+        if (empty($consultRef)) {
+            return response()->json(['success' => false, 'message' => 'Consultation reference number is required.'], 422);
+        }
+
         $consultation = ConsultationModel::where('consultationrefno', $consultRef)->first();
 
-        // Detailed Comment: Compute categorized charge totals from stocks_ledger for billing auditing and SOA breakdown
+        // Categorized charge totals from stocks_ledger for billing auditing and SOA breakdown
         $charges = StocksLedgerModel::where('px_consultcode_cn', $consultRef)->get();
+        $knownGroups = ['DRUGS AND MEDS', 'DIAGNOSTIC', 'PROFESSIONAL FEE', 'PROCEDURES', 'SUPPLIES', 'VACCINES', 'IMMUNIZATION'];
         $totalMeds = (float) $charges->where('item_grouping', 'DRUGS AND MEDS')->sum('totalamt');
         $totalLab = (float) $charges->where('item_grouping', 'DIAGNOSTIC')->sum('totalamt');
         $totalPf = (float) $charges->where('item_grouping', 'PROFESSIONAL FEE')->sum('totalamt');
@@ -1403,11 +1361,12 @@ class SecretaryController extends Controller
         $totalSupplies = (float) $charges->where('item_grouping', 'SUPPLIES')->sum('totalamt');
         $totalVaccines = (float) $charges->where('item_grouping', 'VACCINES')->sum('totalamt');
         $totalImmunizations = (float) $charges->where('item_grouping', 'IMMUNIZATION')->sum('totalamt');
-        $totalOthers = (float) $charges->whereNotIn('item_grouping', ['DRUGS AND MEDS', 'DIAGNOSTIC', 'PROFESSIONAL FEE', 'PROCEDURES', 'SUPPLIES', 'VACCINES', 'IMMUNIZATION'])->sum('totalamt');
+        $totalOthers = (float) $charges->whereNotIn('item_grouping', $knownGroups)->sum('totalamt');
 
         $computedGross = (float) $charges->sum('totalamt');
         $totalGross = $computedGross > 0 ? $computedGross : (float) ($request->total ?? 0);
-        // Detailed Comment: Extract deductions including Senior/PWD, PHIC, HMO, and custom discounts
+
+        // Deductions
         $lessSrpwd = (float) ($request->less_srpwd ?: 0);
         $srpwdRefNo = $request->srpwd_refno ?: null;
         $lessPhic = (float) ($request->phic ?: ($request->less_phic ?: 0));
@@ -1416,13 +1375,12 @@ class SecretaryController extends Controller
         $hmoLoaNo = $request->hmo_loa_no ?: null;
         $lessDiscount = (float) ($request->less_discount ?: ($request->discount ?: 0));
         $discountDescription = $request->discount_description ?: null;
-        $isYakap = ($request->boolean('is_philhealth_yakap') || $request->is_philhealth_yakap == '1' || $request->is_philhealth_yakap === true) ? 1 : 0;
+        $isYakap = ($request->boolean('is_philhealth_yakap') || $request->is_philhealth_yakap == '1') ? 1 : 0;
         $copay = (float) ($request->copay ?: 0);
-        
-        // Detailed Comment: Compute net payable after all Senior/PWD, PhilHealth, HMO, and special discounts
+
         $netPayable = max(0, $totalGross - $lessSrpwd - $lessPhic - $lessHmo - $lessDiscount);
 
-        // Detailed Comment: Resolve HMO code and name from authoritative HMO table "hmo_masterlist"
+        // Resolve HMO code and name from authoritative "hmo_masterlist"
         $hmoInput = $request->hmo_type;
         $hmoCode = $hmoInput;
         $hmoName = null;
@@ -1436,9 +1394,7 @@ class SecretaryController extends Controller
             }
         }
 
-        $record = SettlementsModel::updateOrCreate([
-            'consultationrefno' => $consultRef
-        ], [
+        $values = [
             'pincode' => $consultation->pincode ?? $request->pincode ?? null,
             'docrefno' => $consultation->docrefno ?? null,
             'docname' => $consultation->docname ?? null,
@@ -1468,56 +1424,49 @@ class SecretaryController extends Controller
             'copay' => $copay,
             'payment_card' => (float) ($request->cta ?: 0),
             'cta_type' => $request->cta_type ?? $request->card_type,
-            'created' => Date::now(),
-            'createdby' => auth()->guard('secretary')->check()
-                ? auth()->guard('secretary')->user()->seclname
-                : (auth()->guard('admin')->check() ? auth()->guard('admin')->user()->name : 'System'),
+        ];
+
+        $record = SettlementsModel::updateOrCreate(['consultationrefno' => $consultRef], $values);
+
+        if ($record->wasRecentlyCreated) {
+            $record->created = Date::now();
+            $record->createdby = $actor;
+        }
+        if (empty($record->transactionrefno)) {
+            $record->transactionrefno = 'TRX' . Date::now()->format('mdYHis');
+        }
+        $record->save();
+
+        Log::info('Consultation settlement saved', [
+            'consultationrefno' => $consultRef,
+            'total_gross' => $totalGross,
+            'less_srpwd' => $lessSrpwd,
+            'srpwd_refno' => $srpwdRefNo,
+            'less_phic' => $lessPhic,
+            'phic_icd_rvs' => $phicIcdRvs,
+            'less_hmo' => $lessHmo,
+            'hmocode' => $hmoCode,
+            'hmo_loa_no' => $hmoLoaNo,
+            'hmoname' => $hmoName,
+            'less_discount' => $lessDiscount,
+            'discount_description' => $discountDescription,
+            'is_philhealth_yakap' => $isYakap,
+            'copay' => $copay,
+            'net_payable' => $netPayable,
+            'transactionrefno' => $record->transactionrefno,
+            'recorded_by' => $actor,
         ]);
 
-        if ($record->wasRecentlyCreated || empty($record->transactionrefno)) {
-            $record->transactionrefno = 'TRX' . Date::now()->format('mdYHis');
-            $record->save();
-        }
-
-        if ($record) {
-            // Detailed Comment: Log patient billing settlement save with complete discount audit trail
-            Log::info('Consultation settlement saved', [
-                'consultationrefno' => $request->sett_consultationrefno,
-                'total_gross' => $totalGross,
-                'less_srpwd' => $lessSrpwd,
-                'srpwd_refno' => $srpwdRefNo,
-                'less_phic' => $lessPhic,
-                'phic_icd_rvs' => $phicIcdRvs,
-                'less_hmo' => $lessHmo,
-                'hmocode' => $hmoCode,
-                'hmo_loa_no' => $hmoLoaNo,
-                'hmoname' => $hmoName,
-                'less_discount' => $lessDiscount,
-                'discount_description' => $discountDescription,
-                'is_philhealth_yakap' => $isYakap,
-                'copay' => $copay,
-                'net_payable' => $netPayable,
-                'transactionrefno' => $record->transactionrefno,
-                'recorded_by' => auth()->guard('secretary')->check()
-                    ? auth()->guard('secretary')->user()->seclname
-                    : (auth()->guard('admin')->check() ? auth()->guard('admin')->user()->name : 'System'),
-            ]);
-
-            return response()->json(['success' => true]);
-        }
-
-        return response()->json(['success' => false]);
+        return response()->json(['success' => true]);
     }
 
     /**
      * Detailed Comment: Fetches available HMO entities from the authoritative "hmo_masterlist" table
-     * for the queue settlement modal and secretary consultation consoles.
-     * Selects hmocode and hmoname, filters out null or empty names, and orders alphabetically by hmoname.
-     * Evaluates clientcode with fallback to session/config and global HMO records.
+     * for the queue settlement modal. Filters out null/empty names and orders alphabetically.
      */
     public function fetchHmo()
     {
-        $clientCode = session()->get('clientcode') ?? config('app.clientcode') ?? env('CLIENT_CODE', '122377');
+        $clientCode = session()->get('clientcode') ?? config('app.client_code', '122377');
 
         $query = HMOModel::select(['hmocode', 'hmoname'])
             ->whereNotNull('hmoname')
@@ -1527,8 +1476,8 @@ class SecretaryController extends Controller
         if ($clientCode) {
             $hmo = (clone $query)->where(function ($q) use ($clientCode) {
                 $q->where('dw_clientcode', $clientCode)
-                  ->orWhereNull('dw_clientcode')
-                  ->orWhere('dw_clientcode', '');
+                    ->orWhereNull('dw_clientcode')
+                    ->orWhere('dw_clientcode', '');
             })->get();
             if ($hmo->isNotEmpty()) {
                 return response()->json(['hmo' => $hmo]);
@@ -1541,11 +1490,16 @@ class SecretaryController extends Controller
 
     /**
      * Detailed Comment: Fetches payment and settlement history for a patient based on consultation history.
-     * Resolves all past consultations for this patient by pincode or pxrefno, joins with pxsettlements,
-     * and returns historical payment records, deductions, and payment status.
+     * Payment status counts cash + card + copay, consistent with the daily financial summary.
      */
     public function fetchPatientPaymentHistory(Request $request)
     {
+        foreach (['pincode', 'pxrefno', 'consultationrefno'] as $key) {
+            if (in_array($request->input($key), ['undefined', 'null'], true)) {
+                $request->merge([$key => null]);
+            }
+        }
+
         $pincode = $request->input('pincode');
         $pxrefno = $request->input('pxrefno');
         $consultationrefno = $request->input('consultationrefno');
@@ -1580,7 +1534,9 @@ class SecretaryController extends Controller
         $payments->transform(function ($payment) use ($consultations) {
             $rawDate = $consultations[$payment->consultationrefno] ?? $payment->created;
             $payment->consultation_date = $rawDate ? date('Y-m-d', strtotime($rawDate)) : 'N/A';
-            $totalPaid = (float)($payment->payment_cash ?? 0) + (float)($payment->payment_card ?? 0);
+            $totalPaid = (float)($payment->payment_cash ?? 0)
+                + (float)($payment->payment_card ?? 0)
+                + (float)($payment->copay ?? 0);
             $net = (float)($payment->net_payable ?? $payment->total_gross ?? 0);
             $payment->payment_status = ($totalPaid >= $net && $net > 0) ? 'PAID' : (($totalPaid > 0) ? 'PARTIAL' : 'UNPAID');
             return $payment;
@@ -1593,9 +1549,8 @@ class SecretaryController extends Controller
     }
 
     /**
-     * Detailed Comment: Fetches permanent medical history records (allergies, injections/immunizations,
-     * past medical history, surgical history, family history, and maintenance medications) for a patient.
-     * Cross-references pxrefno and pincode across masterlist and active consultation.
+     * Detailed Comment: Fetches permanent medical history records for a patient,
+     * cross-referencing pxrefno and pincode across masterlist and active consultation.
      */
     public function fetchPatientMedicalHistory(Request $request)
     {
@@ -1603,7 +1558,6 @@ class SecretaryController extends Controller
         $pincode = $request->input('pincode');
         $consultationrefno = $request->input('consultationrefno');
 
-        // Detailed Comment: Defensive sanitization of string placeholders 'undefined' and 'null'
         if ($pxrefno === 'undefined' || $pxrefno === 'null') $pxrefno = null;
         if ($pincode === 'undefined' || $pincode === 'null') $pincode = null;
         if ($consultationrefno === 'undefined' || $consultationrefno === 'null') $consultationrefno = null;
@@ -1614,7 +1568,6 @@ class SecretaryController extends Controller
                 $pxrefno = $consult->pxrefno;
                 if (empty($pincode)) $pincode = $consult->pincode;
 
-                // Fallback to patient masterlist by name and birthday if pxrefno is missing on consultation
                 if (empty($pxrefno) && !empty($consult->patientname) && !empty($consult->birthday)) {
                     $pMaster = PatientMasterlist::where('patientname', $consult->patientname)
                         ->where('birthday', $consult->birthday)
@@ -1653,8 +1606,7 @@ class SecretaryController extends Controller
 
     /**
      * Detailed Comment: Creates or updates permanent medical history records for a patient.
-     * Persists allergies, injections/immunizations, past medical illnesses, surgical operations,
-     * family medical history, and maintenance medications with audit logging of recordedby/updatedby.
+     * Only fields actually sent by the client are written, so omitted fields no longer wipe existing data.
      */
     public function savePatientMedicalHistory(Request $request)
     {
@@ -1662,13 +1614,10 @@ class SecretaryController extends Controller
         $pincode = $request->input('pincode');
         $consultationrefno = $request->input('consultationrefno');
 
-        // Detailed Comment: Defensive sanitization of string placeholders 'undefined' and 'null'
         if ($pxrefno === 'undefined' || $pxrefno === 'null') $pxrefno = null;
         if ($pincode === 'undefined' || $pincode === 'null') $pincode = null;
         if ($consultationrefno === 'undefined' || $consultationrefno === 'null') $consultationrefno = null;
 
-        // Resolve missing pxrefno from consultation or masterlist
-        $consult = null;
         if (empty($pxrefno) && !empty($consultationrefno)) {
             $consult = ConsultationModel::where('consultationrefno', $consultationrefno)->first();
             if ($consult) {
@@ -1701,7 +1650,7 @@ class SecretaryController extends Controller
             ], 422);
         }
 
-        // Determine current user across secretary, doctor, or admin guards
+        // Current user across secretary, doctor, or admin guards
         $userDisplay = 'System';
         if (auth()->guard('secretary')->check()) {
             $sec = auth()->guard('secretary')->user();
@@ -1721,15 +1670,23 @@ class SecretaryController extends Controller
         $data = [
             'pxrefno' => $pxrefno ?: ($existing->pxrefno ?? null),
             'pincode' => $pincode ?: ($existing->pincode ?? null),
-            'allergies' => $request->input('allergies'),
-            'injections_immunization' => $request->input('injections_immunization'),
-            'past_medical_history' => $request->input('past_medical_history'),
-            'surgical_history' => $request->input('surgical_history'),
-            'family_history' => $request->input('family_history'),
-            'maintenance_medications' => $request->input('maintenance_medications'),
-            'notes' => $request->input('notes'),
             'updatedby' => $userDisplay,
         ];
+
+        $fields = [
+            'allergies',
+            'injections_immunization',
+            'past_medical_history',
+            'surgical_history',
+            'family_history',
+            'maintenance_medications',
+            'notes',
+        ];
+        foreach ($fields as $field) {
+            if ($request->has($field)) {
+                $data[$field] = $request->input($field);
+            }
+        }
 
         if (!$existing) {
             $data['recordedby'] = $userDisplay;
@@ -1754,8 +1711,8 @@ class SecretaryController extends Controller
     }
 
     /**
-     * Detailed Comment: Fetches PhilHealth Yakap Medical & Surgical History for active patient in Secretary Console.
-     * Searches across dd_profile_1, dd_profile_medhist, dd_profile_mhspecific, and dd_profile_surghist
+     * Detailed Comment: Fetches PhilHealth Yakap Medical & Surgical History for the active patient.
+     * Searches dd_profile_1, dd_profile_medhist, dd_profile_mhspecific and dd_profile_surghist,
      * resolving links via px_pin, pincode, pxrefno, or consultation case number.
      */
     public function fetchPatientYakapMedicalHistory(Request $request)
@@ -1770,7 +1727,6 @@ class SecretaryController extends Controller
         if ($caseno === 'undefined' || $caseno === 'null') $caseno = null;
         if ($consultationrefno === 'undefined' || $consultationrefno === 'null') $consultationrefno = null;
 
-        // Detailed Comment: Resolve missing identifiers from ConsultationModel or PatientMasterlist
         if (!empty($consultationrefno)) {
             $consult = ConsultationModel::where('consultationrefno', $consultationrefno)->first();
             if ($consult) {
@@ -1792,7 +1748,7 @@ class SecretaryController extends Controller
             }
         }
 
-        // Detailed Comment: Locate existing Yakap Profile in dd_profile_1
+        // Locate existing Yakap Profile in dd_profile_1
         $profile = null;
         if (!empty($caseno)) {
             $profile = ProfileModel::where('en_CaseNo', $caseno)->first();
@@ -1807,40 +1763,22 @@ class SecretaryController extends Controller
         }
 
         $transNo = $profile ? $profile->dTransNo : null;
-        $profileCaseNo = $profile ? $profile->en_CaseNo : $caseno;
         $pinToMatch = $profile ? ($profile->px_pin ?: $profile->dPatientPin) : ($pincode ?: $pxrefno);
 
-        // Detailed Comment: Query medical conditions and specific descriptions
-        $medHistQuery = ProfileMedHistModel::query();
-        if ($transNo) {
-            $medHistQuery->where('p_TransNo', $transNo);
-        } elseif (!empty($pinToMatch)) {
-            $medHistQuery->where('px_pin', $pinToMatch);
-        } else {
-            $medHistQuery->whereRaw('1 = 0');
-        }
-        $medHist = $medHistQuery->get();
+        $scope = function ($query) use ($transNo, $pinToMatch) {
+            if ($transNo) {
+                $query->where('p_TransNo', $transNo);
+            } elseif (!empty($pinToMatch)) {
+                $query->where('px_pin', $pinToMatch);
+            } else {
+                $query->whereRaw('1 = 0');
+            }
+            return $query;
+        };
 
-        $mhSpecificQuery = ProfileMhSpecificModel::query();
-        if ($transNo) {
-            $mhSpecificQuery->where('p_TransNo', $transNo);
-        } elseif (!empty($pinToMatch)) {
-            $mhSpecificQuery->where('px_pin', $pinToMatch);
-        } else {
-            $mhSpecificQuery->whereRaw('1 = 0');
-        }
-        $mhSpecific = $mhSpecificQuery->get();
-
-        // Detailed Comment: Query past surgical procedures
-        $surgHistQuery = ProfileSurgHistModel::query();
-        if ($transNo) {
-            $surgHistQuery->where('p_TransNo', $transNo);
-        } elseif (!empty($pinToMatch)) {
-            $surgHistQuery->where('px_pin', $pinToMatch);
-        } else {
-            $surgHistQuery->whereRaw('1 = 0');
-        }
-        $surgHist = $surgHistQuery->get();
+        $medHist = $scope(ProfileMedHistModel::query())->get();
+        $mhSpecific = $scope(ProfileMhSpecificModel::query())->get();
+        $surgHist = $scope(ProfileSurgHistModel::query())->get();
 
         Log::info('Fetched Yakap Medical & Surgical History for patient', [
             'pxrefno' => $pxrefno,
@@ -1863,8 +1801,8 @@ class SecretaryController extends Controller
 
     /**
      * Detailed Comment: Persists PhilHealth Yakap Medical & Surgical History from Secretary Console.
-     * Updates dd_profile_medhist, dd_profile_mhspecific, and dd_profile_surghist, creating a profile
-     * header record in dd_profile_1 if one does not already exist.
+     * Updates dd_profile_medhist, dd_profile_mhspecific and dd_profile_surghist inside a transaction,
+     * creating a profile header record in dd_profile_1 if none exists.
      */
     public function savePatientYakapMedicalHistory(Request $request)
     {
@@ -1881,7 +1819,6 @@ class SecretaryController extends Controller
         if ($consultationrefno === 'undefined' || $consultationrefno === 'null') $consultationrefno = null;
         if ($transNo === 'undefined' || $transNo === 'null') $transNo = null;
 
-        // Detailed Comment: Resolve missing patient identifiers
         if (!empty($consultationrefno)) {
             $consult = ConsultationModel::where('consultationrefno', $consultationrefno)->first();
             if ($consult) {
@@ -1907,7 +1844,6 @@ class SecretaryController extends Controller
             ], 422);
         }
 
-        // Determine current logged in user display
         $userDisplay = 'System';
         if (auth()->guard('secretary')->check()) {
             $sec = auth()->guard('secretary')->user();
@@ -1923,7 +1859,7 @@ class SecretaryController extends Controller
         try {
             DB::beginTransaction();
 
-            // Detailed Comment: Locate or generate Yakap profile record
+            // Locate or generate Yakap profile record
             $profile = null;
             if (!empty($transNo)) {
                 $profile = ProfileModel::where('dTransNo', $transNo)->first();
@@ -1945,14 +1881,13 @@ class SecretaryController extends Controller
                 $profileCaseNo = $profile->en_CaseNo ?: ($caseno ?: 'C' . now()->format('YmdHis'));
                 $pinCodeToUse = $profile->px_pin ?: ($pincode ?: $pxrefno);
             } else {
-                // Generate a unique Yakap profile transaction number
-                $accreNo = 'H10037034';
-                try {
-                    $accreNo = $clientService->getHciAccreditationNumber() ?: 'H10037034';
-                } catch (\Exception $e) {
-                    $accreNo = 'H10037034';
-                }
-                $transNo = 'P' . $accreNo . now()->format('Ym') . rand(10000, 99999);
+                $accreNo = rescue(fn() => $clientService->getHciAccreditationNumber(), 'H10037034') ?: 'H10037034';
+
+                // Generate a unique Yakap profile transaction number (re-roll on collision)
+                do {
+                    $transNo = 'P' . $accreNo . now()->format('Ym') . random_int(10000, 99999);
+                } while (ProfileModel::where('dTransNo', $transNo)->exists());
+
                 $profileCaseNo = $caseno ?: ('C' . now()->format('YmdHis'));
                 $pinCodeToUse = $pincode ?: $pxrefno;
 
@@ -1975,7 +1910,7 @@ class SecretaryController extends Controller
                 ]);
             }
 
-            // Detailed Comment: Process and persist Past Medical Conditions
+            // Past Medical Conditions
             $chkMedHistDiseases = $request->input('chkMedHistDiseases', []);
             $medhistToSave = [];
             $mhspecificToSave = [];
@@ -2017,7 +1952,6 @@ class SecretaryController extends Controller
                 }
             }
 
-            // Delete previous medical conditions for this profile transaction number and insert fresh ones
             ProfileMedHistModel::where('p_TransNo', $transNo)->delete();
             ProfileMhSpecificModel::where('p_TransNo', $transNo)->delete();
 
@@ -2028,7 +1962,7 @@ class SecretaryController extends Controller
                 ProfileMhSpecificModel::insert($mhspecificToSave);
             }
 
-            // Detailed Comment: Process and persist Past Surgical Procedures
+            // Past Surgical Procedures
             $surgicalHistory = $request->input('surgicalHistory', []);
             $surgHistToSave = [];
 
@@ -2055,7 +1989,6 @@ class SecretaryController extends Controller
                 }
             }
 
-            // Delete previous surgical records for this profile and insert updated ones
             ProfileSurgHistModel::where('p_TransNo', $transNo)->delete();
             if (!empty($surgHistToSave)) {
                 ProfileSurgHistModel::insert($surgHistToSave);
@@ -2077,7 +2010,7 @@ class SecretaryController extends Controller
                 'transNo' => $transNo,
                 'profile' => $profile,
             ]);
-        } catch (\Exception $e) {
+        } catch (\Throwable $e) {
             DB::rollBack();
             Log::error('Error saving Yakap Medical History', [
                 'error' => $e->getMessage(),
@@ -2092,43 +2025,36 @@ class SecretaryController extends Controller
     }
 
     /**
-     * Detailed Comment: Computes aggregated daily income financial report for all patients in queue.
-     * Calculates total gross billing, PhilHealth deductions, HMO coverage, Senior/PWD discounts,
-     * net payable, cash collected, card/CTA, PhilHealth Yakap/Co-Pay, total collected, and remaining balance.
+     * Detailed Comment: Shared builder for the daily queue financial summary, used by both the JSON endpoint
+     * and the PDF report so the two can never drift apart again (the PDF previously read a non-existent
+     * discount_senior column and always showed 0 for Senior/PWD).
+     * Returns [queueDate, consultations, settlements, totals, items].
      */
-    public function fetchQueueFinancialSummary(Request $request)
+    private function buildFinancialSummary(Request $request): array
     {
         $queueDate = $request->input('queuedate') ?: $request->input('date') ?: now()->toDateString();
         $docrefno = $request->input('docrefno');
 
         $query = ConsultationModel::whereDate('consultation_date', $queueDate);
-        if (!empty($docrefno) && $docrefno !== 'null' && $docrefno !== 'all') {
+        if (!empty($docrefno) && !in_array($docrefno, ['null', 'all'], true)) {
             $query->where('docrefno', $docrefno);
         }
 
         $consultations = $query->orderBy('queueno', 'asc')->orderBy('id', 'asc')->get();
-        $consultationRefNos = $consultations->pluck('consultationrefno')->filter()->toArray();
+        $consultationRefNos = $consultations->pluck('consultationrefno')->filter()->values()->toArray();
 
         $settlements = SettlementsModel::whereIn('consultationrefno', $consultationRefNos)
             ->get()
             ->keyBy('consultationrefno');
 
-        $totalGross = 0;
-        $totalPhic = 0;
-        $totalHmo = 0;
-        $totalSenior = 0;
-        $totalNet = 0;
-        $totalCash = 0;
-        $totalCard = 0;
-        $totalCopay = 0;
-        $totalPaid = 0;
-        $totalBalance = 0;
-
+        $totals = array_fill_keys(
+            ['gross', 'phic', 'hmo', 'senior', 'net', 'cash', 'card', 'copay', 'paid', 'balance'],
+            0.0
+        );
         $items = [];
 
         foreach ($consultations as $consult) {
-            $ref = $consult->consultationrefno;
-            $settle = $settlements->get($ref);
+            $settle = $settlements->get($consult->consultationrefno);
 
             $gross = (float)($settle->total_gross ?? $settle->total_amount ?? 0);
             $phic = (float)($settle->less_phic ?? 0);
@@ -2141,16 +2067,9 @@ class SecretaryController extends Controller
             $paid = $cash + $card + $copay;
             $balance = max(0, $net - $paid);
 
-            $totalGross += $gross;
-            $totalPhic += $phic;
-            $totalHmo += $hmo;
-            $totalSenior += $senior;
-            $totalNet += $net;
-            $totalCash += $cash;
-            $totalCard += $card;
-            $totalCopay += $copay;
-            $totalPaid += $paid;
-            $totalBalance += $balance;
+            foreach (compact('gross', 'phic', 'hmo', 'senior', 'net', 'cash', 'card', 'copay', 'paid', 'balance') as $key => $value) {
+                $totals[$key] += $value;
+            }
 
             $status = 'UNPAID';
             if ($settle) {
@@ -2182,6 +2101,17 @@ class SecretaryController extends Controller
             ];
         }
 
+        return [$queueDate, $consultations, $settlements, $totals, $items];
+    }
+
+    /**
+     * Detailed Comment: Computes aggregated daily income financial report for all patients in queue
+     * (gross billing, PhilHealth, HMO, Senior/PWD, net, cash, card/CTA, Yakap co-pay, collected, balance).
+     */
+    public function fetchQueueFinancialSummary(Request $request)
+    {
+        [$queueDate, $consultations, $settlements, $t, $items] = $this->buildFinancialSummary($request);
+
         return response()->json([
             'success' => true,
             'queuedate' => $queueDate,
@@ -2190,18 +2120,18 @@ class SecretaryController extends Controller
             'settled_patients' => $settlements->count(),
             'summary' => [
                 'total_patients' => $consultations->count(),
-                'total_gross' => round($totalGross, 2),
-                'gross_total' => round($totalGross, 2),
-                'total_phic' => round($totalPhic, 2),
-                'total_hmo' => round($totalHmo, 2),
-                'total_senior' => round($totalSenior, 2),
-                'total_srpwd' => round($totalSenior, 2),
-                'total_net' => round($totalNet, 2),
-                'total_cash' => round($totalCash, 2),
-                'total_card' => round($totalCard, 2),
-                'total_copay' => round($totalCopay, 2),
-                'total_paid' => round($totalPaid, 2),
-                'total_balance' => round($totalBalance, 2),
+                'total_gross' => round($t['gross'], 2),
+                'gross_total' => round($t['gross'], 2),
+                'total_phic' => round($t['phic'], 2),
+                'total_hmo' => round($t['hmo'], 2),
+                'total_senior' => round($t['senior'], 2),
+                'total_srpwd' => round($t['senior'], 2),
+                'total_net' => round($t['net'], 2),
+                'total_cash' => round($t['cash'], 2),
+                'total_card' => round($t['card'], 2),
+                'total_copay' => round($t['copay'], 2),
+                'total_paid' => round($t['paid'], 2),
+                'total_balance' => round($t['balance'], 2),
             ],
             'items' => $items,
         ]);
@@ -2209,111 +2139,33 @@ class SecretaryController extends Controller
 
     /**
      * Detailed Comment: Streams PDF printable report for the daily queue financial summary.
-     * Formats consolidated billing, PhilHealth/HMO deductions, cash/card/copay collections,
-     * and itemized patient billing slips for clinic administration and financial audit.
      */
     public function printFinancialReport(Request $request)
     {
-        $queueDate = $request->input('queuedate') ?: $request->input('date') ?: now()->toDateString();
-        $docrefno = $request->input('docrefno');
+        [$queueDate, $consultations,, $t, $itemRows] = $this->buildFinancialSummary($request);
 
-        $query = ConsultationModel::whereDate('consultation_date', $queueDate);
+        $items = array_map(fn($row) => (object)$row, $itemRows);
+
         $doctorName = 'All Attending Doctors';
-        if (!empty($docrefno) && $docrefno !== 'null' && $docrefno !== 'all') {
-            $query->where('docrefno', $docrefno);
+        $docrefno = $request->input('docrefno');
+        if (!empty($docrefno) && !in_array($docrefno, ['null', 'all'], true)) {
             $doc = DoctorsProfileModel::where('docrefno', $docrefno)->first();
             if ($doc) {
                 $doctorName = 'Dr. ' . $doc->docname;
             }
         }
 
-        $consultations = $query->orderBy('queueno', 'asc')->orderBy('id', 'asc')->get();
-        $consultationRefNos = $consultations->pluck('consultationrefno')->filter()->toArray();
-
-        $settlements = SettlementsModel::whereIn('consultationrefno', $consultationRefNos)
-            ->get()
-            ->keyBy('consultationrefno');
-
-        $totalGross = 0;
-        $totalPhic = 0;
-        $totalHmo = 0;
-        $totalSenior = 0;
-        $totalNet = 0;
-        $totalCash = 0;
-        $totalCard = 0;
-        $totalCopay = 0;
-        $totalPaid = 0;
-        $totalBalance = 0;
-
-        $items = [];
-
-        foreach ($consultations as $consult) {
-            $ref = $consult->consultationrefno;
-            $settle = $settlements->get($ref);
-
-            $gross = (float)($settle->total_gross ?? 0);
-            $phic = (float)($settle->less_phic ?? 0);
-            $hmo = (float)($settle->less_hmo ?? 0);
-            $senior = (float)($settle->discount_senior ?? 0);
-            $net = (float)($settle->net_payable ?? 0);
-            $cash = (float)($settle->payment_cash ?? 0);
-            $card = (float)($settle->payment_card ?? 0);
-            $copay = (float)($settle->copay ?? 0);
-            $paid = $cash + $card + $copay;
-            $balance = max(0, $net - $paid);
-
-            $totalGross += $gross;
-            $totalPhic += $phic;
-            $totalHmo += $hmo;
-            $totalSenior += $senior;
-            $totalNet += $net;
-            $totalCash += $cash;
-            $totalCard += $card;
-            $totalCopay += $copay;
-            $totalPaid += $paid;
-            $totalBalance += $balance;
-
-            $status = 'UNPAID';
-            if ($settle) {
-                if ($paid >= $net && $net > 0) {
-                    $status = 'PAID';
-                } elseif ($paid > 0) {
-                    $status = 'PARTIAL';
-                }
-            }
-
-            $items[] = (object)[
-                'queueno' => $consult->queueno ?: '--',
-                'consultationrefno' => $consult->consultationrefno,
-                'patientname' => $consult->patientname,
-                'docname' => $consult->docname,
-                'gross' => $gross,
-                'phic' => $phic,
-                'hmo' => $hmo,
-                'senior' => $senior,
-                'net' => $net,
-                'cash' => $cash,
-                'card' => $card,
-                'copay' => $copay,
-                'paid' => $paid,
-                'balance' => $balance,
-                'status' => $status,
-                'is_philhealth_yakap' => (bool)($settle->is_philhealth_yakap ?? false),
-                'hmo_loa_no' => $settle->hmo_loa_no ?? '',
-            ];
-        }
-
         $summary = (object)[
-            'total_gross' => $totalGross,
-            'total_phic' => $totalPhic,
-            'total_hmo' => $totalHmo,
-            'total_senior' => $totalSenior,
-            'total_net' => $totalNet,
-            'total_cash' => $totalCash,
-            'total_card' => $totalCard,
-            'total_copay' => $totalCopay,
-            'total_paid' => $totalPaid,
-            'total_balance' => $totalBalance,
+            'total_gross' => $t['gross'],
+            'total_phic' => $t['phic'],
+            'total_hmo' => $t['hmo'],
+            'total_senior' => $t['senior'],
+            'total_net' => $t['net'],
+            'total_cash' => $t['cash'],
+            'total_card' => $t['card'],
+            'total_copay' => $t['copay'],
+            'total_paid' => $t['paid'],
+            'total_balance' => $t['balance'],
             'total_patients' => $consultations->count(),
         ];
 
@@ -2343,4 +2195,3 @@ class SecretaryController extends Controller
         }
     }
 }
-

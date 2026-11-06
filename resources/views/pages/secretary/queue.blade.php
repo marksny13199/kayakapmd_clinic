@@ -466,10 +466,10 @@
                                                     id="patient_classification">
                                                     @if(isset($patientClassifications) && $patientClassifications->isNotEmpty())
                                                         @foreach ($patientClassifications as $pClass)
-                                                            <option value="{{ $pClass->classification_code }}"
-                                                                data-subfields="{{ json_encode($pClass->sub_fields ?? []) }}"
+                                                            <option value="{{ $pClass->CLASS_CODE }}"
+                                                                data-subfields="[]"
                                                                 {{ $loop->first ? 'selected' : '' }}>
-                                                                {{ $pClass->classification_name }}
+                                                                {{ $pClass->CLASS_DEF }}
                                                             </option>
                                                         @endforeach
                                                     @else

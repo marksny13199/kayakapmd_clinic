@@ -4,14 +4,15 @@
 <head>
     {{-- Detailed Comment: Immediate synchronous theme initialization to prevent Flash of Unstyled Content (FOUC) on login screen --}}
     <script>
-        (function () {
+        (function() {
             try {
                 const storedTheme = localStorage.getItem('theme') || 'system';
                 const getPreferredTheme = () => {
                     if (storedTheme === 'dark' || storedTheme === 'light') {
                         return storedTheme;
                     }
-                    return window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+                    return window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' :
+                        'light';
                 };
                 document.documentElement.setAttribute('data-bs-theme', getPreferredTheme());
             } catch (e) {
@@ -90,25 +91,29 @@
         {{-- Detailed Comment: Floating top-right theme switcher dropdown allowing Dark, Light, and System mode selection on the login screen --}}
         <div class="position-absolute top-0 end-0 p-3" style="z-index: 20;">
             <div class="dropdown" id="theme_switcher_dropdown">
-                <button class="btn btn-light dropdown-toggle d-flex align-items-center gap-1 shadow-sm" id="bd-theme" type="button" aria-expanded="false" data-bs-toggle="dropdown" aria-label="Toggle theme">
+                <button class="btn btn-light dropdown-toggle d-flex align-items-center gap-1 shadow-sm" id="bd-theme"
+                    type="button" aria-expanded="false" data-bs-toggle="dropdown" aria-label="Toggle theme">
                     <i class="fa-solid fa-circle-half-stroke me-1" id="theme-active-icon"></i>
                     <span class="d-none d-md-inline" id="theme-active-text">System</span>
                 </button>
                 <ul class="dropdown-menu dropdown-menu-end shadow" aria-labelledby="bd-theme" id="theme_options_menu">
                     <li>
-                        <button type="button" class="dropdown-item d-flex align-items-center justify-content-between" data-bs-theme-value="light" id="theme_option_light">
+                        <button type="button" class="dropdown-item d-flex align-items-center justify-content-between"
+                            data-bs-theme-value="light" id="theme_option_light">
                             <span><i class="fa-solid fa-sun me-2 text-warning"></i> Light</span>
                             <i class="fa-solid fa-check text-primary theme-check-icon d-none"></i>
                         </button>
                     </li>
                     <li>
-                        <button type="button" class="dropdown-item d-flex align-items-center justify-content-between" data-bs-theme-value="dark" id="theme_option_dark">
+                        <button type="button" class="dropdown-item d-flex align-items-center justify-content-between"
+                            data-bs-theme-value="dark" id="theme_option_dark">
                             <span><i class="fa-solid fa-moon me-2 text-info"></i> Dark</span>
                             <i class="fa-solid fa-check text-primary theme-check-icon d-none"></i>
                         </button>
                     </li>
                     <li>
-                        <button type="button" class="dropdown-item d-flex align-items-center justify-content-between" data-bs-theme-value="system" id="theme_option_system">
+                        <button type="button" class="dropdown-item d-flex align-items-center justify-content-between"
+                            data-bs-theme-value="system" id="theme_option_system">
                             <span><i class="fa-solid fa-circle-half-stroke me-2 text-secondary"></i> System</span>
                             <i class="fa-solid fa-check text-primary theme-check-icon d-none"></i>
                         </button>
@@ -121,7 +126,9 @@
             <div class="login-card w-25 d-flex align-items-center justify-content-center rounded-5 shadow">
                 <div class="px-0 py-5 w-100 p-0 d-flex flex-column align-items-center gap-3">
                     {{-- Detailed Comment: Dynamically render clinic logo configured in App Theme Settings with fallback to default logo --}}
-                    <img class="d-flex" style="width: 20rem; max-height: 10rem; object-fit: contain;" src="{{ asset($activeTheme->logo_path ?? 'images/logo.png') }}" alt="company_logo" id="login_header_logo">
+                    <img class="d-flex" style="width: 20rem; max-height: 10rem; object-fit: contain;"
+                        src="{{ asset($activeTheme->logo_path ?? 'images/logo.png') }}" alt="company_logo"
+                        id="login_header_logo">
 
                     <form class="d-flex flex-column gap-3 w-75" method="POST"
                         action="{{ route('login.authenticate') }}">

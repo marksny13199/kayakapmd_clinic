@@ -31,6 +31,7 @@ use App\Models\DoctorsProfileModel;
 use App\Models\MedicineMasterlistModel;
 use App\Models\MedicineModel;
 use App\Models\KayakapProfileModel;
+use App\Models\PatientClassificationModel;
 use App\Models\SecretaryDoctorsModel;
 use App\Models\SecretaryModel;
 use App\Models\SettlementsModel;
@@ -111,7 +112,8 @@ class ManagementController extends Controller
         $secretaries = SecretaryModel::select(['secrefno', 'seclname'])
             ->get();
 
-        $patientClassifications = \App\Models\PatientClassificationModel::active()->get();
+        // lib_hci_class has no status column, so load its classification definitions in display order.
+        $patientClassifications = PatientClassificationModel::orderBy('CLASS_DEF')->get();
 
         return view('pages.secretary.queue', [
             'doctors' => $doctors,
@@ -3909,4 +3911,3 @@ class ManagementController extends Controller
         ]);
     }
 }
-
